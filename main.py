@@ -1,74 +1,190 @@
-import torch.nn as nn 
 import os
 import cv2
-import dlib
+import torch
 import numpy as np
-from scipy.spatial import distance
-####
+import dlib
 
-# ========== 初始化 ==========
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+from models.experimental import attempt_load
+from utils.datasets import letterbox
+from utils.general import check_img_size, non_max_suppression_face, scale_coords
+from utils.torch_utils import select_device
 
-# ========== EAR ==========
+
+############################################
+# EAR / MAR 计算函数
+############################################
+
+def euclidean_dist(p1, p2):
+    return np.linalg.norm(p1 - p2)
+
+
 def compute_EAR(eye):
-    A = distance.euclidean(eye[1], eye[5])
-    B = distance.euclidean(eye[2], eye[4])
-    C = distance.euclidean(eye[0], eye[3])
+    A = euclidean_dist(eye[1], eye[5])
+    B = euclidean_dist(eye[2], eye[4])
+    C = euclidean_dist(eye[0], eye[3])
     return (A + B) / (2.0 * C)
-# EAR小于0.2通常被认为是闭眼状态，可以根据需要调整这个阈值
 
-# ========== MAR ==========
+
 def compute_MAR(mouth):
-    A = distance.euclidean(mouth[1], mouth[9])
-    B = distance.euclidean(mouth[3], mouth[7])
-    C = distance.euclidean(mouth[0], mouth[6])
-    return (A + B) / (2.0 * C)
-# MAR大于0.5通常被认为是张嘴状态，可以根据需要调整这个阈值
+    A = euclidean_dist(mouth[2], mouth[10])
+    B = euclidean_dist(mouth[3], mouth[9])
+    C = euclidean_dist(mouth[4], mouth[8])
+    D = euclidean_dist(mouth[0], mouth[6])
+    return (A + B + C) / (2.0 * D)
 
-# ========== 提取特征 ==========
-def extract_features(image_path):
-    image = cv2.imread(image_path)  # 返回图片
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)  # 转为灰度图像
 
-    faces = detector(gray) # 检测人脸
+############################################
+# 1 加载 YOLOv5-face
+############################################
 
-    if len(faces) == 0:
-        print(f"{image_path} 未检测到人脸")
-        return None
+device = select_device('')
+weights = "weights/yolov5s-face.pt"
 
-    face = faces[0] #提取出第一张人脸
-    
-    shape = predictor(gray, face)
+model = attempt_load(weights, map_location=device)
+stride = int(model.stride.max())
+imgsz = check_img_size(640)
 
-    landmarks = np.zeros((68, 2))
+model.eval()
 
-    for i in range(68):
-        landmarks[i] = (shape.part(i).x, shape.part(i).y)
 
-    # 眼睛
+############################################
+# 2 加载 dlib landmark
+############################################
+
+predictor_path = "weights/shape_predictor_68_face_landmarks.dat"
+predictor = dlib.shape_predictor(predictor_path)
+
+
+############################################
+# 3 遍历图片
+############################################
+
+for i in range(1, 21):
+
+    img_path = f"data/google/driver_{i:02d}.jpg"
+
+    if not os.path.exists(img_path):
+        print(f"{img_path} 不存在")
+        continue
+
+    print("\n=================================")
+    print(f"处理图片: {img_path}")
+
+    img0 = cv2.imread(img_path)
+
+    if img0 is None:
+        print("图片读取失败")
+        continue
+
+
+    ############################################
+    # 4 YOLOv5-face 推理
+    ############################################
+
+    img = letterbox(img0, imgsz)[0]
+
+    img = img[:, :, ::-1].transpose(2, 0, 1)
+    img = np.ascontiguousarray(img)
+
+    img = torch.from_numpy(img).to(device)
+    img = img.float()
+    img /= 255.0
+
+    if img.ndimension() == 3:
+        img = img.unsqueeze(0)
+
+    pred = model(img)[0]
+
+    pred = non_max_suppression_face(
+        pred,
+        conf_thres=0.5,
+        iou_thres=0.5
+    )
+
+
+    ############################################
+    # 5 是否检测到人脸
+    ############################################
+
+    if pred[0] is None or len(pred[0]) == 0:
+        print("未检测到人脸")
+        continue
+
+    print("检测到人脸")
+
+    det = pred[0]
+
+    det[:, :4] = scale_coords(img.shape[2:], det[:, :4], img0.shape).round()
+
+
+    ############################################
+    # 6 选择最大人脸
+    ############################################
+
+    max_area = 0
+    best_box = None
+
+    for det_item in det:
+
+        x1 = int(det_item[0])
+        y1 = int(det_item[1])
+        x2 = int(det_item[2])
+        y2 = int(det_item[3])
+
+        area = (x2 - x1) * (y2 - y1)
+
+        if area > max_area:
+            max_area = area
+            best_box = (x1, y1, x2, y2)
+
+    if best_box is None:
+        print("人脸检测失败")
+        continue
+
+    x1, y1, x2, y2 = best_box
+
+
+    ############################################
+    # 7 dlib 关键点检测
+    ############################################
+
+    gray = cv2.cvtColor(img0, cv2.COLOR_BGR2GRAY)
+
+    rect = dlib.rectangle(x1, y1, x2, y2)
+
+    shape = predictor(gray, rect)
+
+    landmarks = np.zeros((68, 2), dtype="int")
+
+    for j in range(68):
+        landmarks[j] = (shape.part(j).x, shape.part(j).y)
+
+
+    ############################################
+    # 8 计算 EAR
+    ############################################
+
     left_eye = landmarks[36:42]
     right_eye = landmarks[42:48]
-    EAR = (compute_EAR(left_eye) + compute_EAR(right_eye)) / 2.0
 
-    # 嘴巴
+    EAR_left = compute_EAR(left_eye)
+    EAR_right = compute_EAR(right_eye)
+
+    EAR = (EAR_left + EAR_right) / 2.0
+
+
+    ############################################
+    # 9 计算 MAR
+    ############################################
+
     mouth = landmarks[48:68]
+
     MAR = compute_MAR(mouth)
 
-    return EAR, MAR
 
-# ========== 主程序 ==========
-data_folder = "data"
+    ############################################
+    # 10 输出结果
+    ############################################
 
-print("\n开始处理图片...\n")
-
-for filename in os.listdir(data_folder):
-    if filename.endswith(".jpg"):
-        path = os.path.join(data_folder, filename)
-        result = extract_features(path)
-
-        if result is not None:
-            EAR, MAR = result
-            print(f"{filename}  ->  EAR: {EAR:.3f}  MAR: {MAR:.3f}")
-
-print("\n处理完成。")
+    print(f"EAR: {EAR:.4f}")
+    print(f"MAR: {MAR:.4f}")
